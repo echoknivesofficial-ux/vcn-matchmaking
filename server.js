@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,72 +17,74 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────
-// In-memory storage
+// State
 // ─────────────────────────────────────────────────────────────
-// matches[code] = {
-//     code: 'VCN-XXXXXX',
-//     createdAt: timestamp,
-//     createdBy: { userId, username, avatarUrl },
-//     players: [{ userId, username, avatarUrl, joinedAt }],
-//     status: 'waiting' | 'active' | 'finished',
-//     gameState: 'white-turn' | 'black-turn' | 'white-won' | 'black-won' | 'draw',
-//     board: initial 8x8 array,
-//     moves: [],
-//     lastActivity: timestamp
-// }
+// queue: players waiting to be matched
+// queue = [{ userId, username, avatarUrl, timeControl, joinedQueueAt }]
+const queue = [];
+
+// matches: active matches
+// matches[secretCode] = { code, players, gameState, moves, status, ... }
 const matches = {};
 
-// Clean up old matches (older than 2 hours) every 15 minutes
+// userToMatch: userId → secretCode (so we can find the match quickly)
+const userToMatch = {};
+
+// Cleanup stale entries every 5 minutes
 setInterval(() => {
     const now = Date.now();
-    let cleaned = 0;
-    for (const code in matches) {
-        if (now - matches[code].lastActivity > 2 * 60 * 60 * 1000) {
-            delete matches[code];
-            cleaned++;
+
+    // Remove players stuck in queue for more than 5 minutes
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (now - queue[i].joinedQueueAt > 5 * 60 * 1000) {
+            console.log(`[cleanup] Removing stale queued player ${queue[i].username}`);
+            queue.splice(i, 1);
         }
     }
-    if (cleaned > 0) console.log(`[cleanup] Removed ${cleaned} stale matches`);
-}, 15 * 60 * 1000);
+
+    // Remove finished matches older than 1 hour
+    for (const code in matches) {
+        if (matches[code].status === 'finished' && now - matches[code].lastActivity > 60 * 60 * 1000) {
+            const players = matches[code].players.map(p => p.userId);
+            players.forEach(id => delete userToMatch[id]);
+            delete matches[code];
+        }
+    }
+
+    // Remove matches with no activity for 2 hours
+    for (const code in matches) {
+        if (now - matches[code].lastActivity > 2 * 60 * 60 * 1000) {
+            const players = matches[code].players.map(p => p.userId);
+            players.forEach(id => delete userToMatch[id]);
+            delete matches[code];
+        }
+    }
+}, 5 * 60 * 1000);
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1 to avoid confusion
-
-function generateCode() {
-    let code = 'VCN-';
-    for (let i = 0; i < 6; i++) {
-        code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
-    }
-    return code;
+function generateSecretCode() {
+    // 48-char hex (192 bits of entropy) — impossible to guess
+    return crypto.randomBytes(24).toString('hex');
 }
 
-function generateUniqueCode() {
-    let code;
-    let attempts = 0;
-    do {
-        code = generateCode();
-        attempts++;
-        if (attempts > 100) throw new Error('Could not generate unique code');
-    } while (matches[code] && matches[code].status !== 'finished');
-    return code;
-}
-
-function publicMatchView(match) {
+function publicMatchView(match, forUserId) {
+    const myIndex = forUserId ? match.players.findIndex(p => p.userId === forUserId) : -1;
+    const myColor = myIndex === 0 ? 'white' : (myIndex === 1 ? 'black' : null);
     return {
-        code: match.code,
         status: match.status,
         createdAt: match.createdAt,
+        gameState: match.gameState,
+        playerCount: match.players.length,
+        moveCount: match.moves.length,
+        timeControl: match.timeControl,
+        myColor,
         players: match.players.map(p => ({
             userId: p.userId,
             username: p.username,
-            avatarUrl: p.avatarUrl,
-            joinedAt: p.joinedAt
-        })),
-        playerCount: match.players.length,
-        gameState: match.gameState,
-        moveCount: match.moves.length
+            avatarUrl: p.avatarUrl
+        }))
     };
 }
 
@@ -90,17 +93,18 @@ function publicMatchView(match) {
 // ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
     res.json({
-        service: 'VCN Matchmaking Server',
+        service: 'VCN Random Matchmaking Server',
         status: 'online',
+        queuedPlayers: queue.length,
         activeMatches: Object.keys(matches).length,
         endpoints: {
-            createMatch: 'POST /create-match',
-            joinMatch: 'POST /join-match',
-            matchStatus: 'GET /match-status?code=VCN-XXXXXX',
+            findMatch: 'POST /find-match',
+            cancelSearch: 'POST /cancel-search',
+            matchStatus: 'GET /match-status?userId=X',
             submitMove: 'POST /submit-move',
-            getMoves: 'GET /get-moves?code=VCN-XXXXXX&since=0',
+            getMoves: 'POST /get-moves',
             finishMatch: 'POST /finish-match',
-            listMatches: 'GET /list-matches'
+            health: 'GET /health'
         }
     });
 });
@@ -113,172 +117,155 @@ app.get('/health', (req, res) => {
         status: 'ok',
         time: new Date().toISOString(),
         uptime: process.uptime(),
+        queuedPlayers: queue.length,
         activeMatches: Object.keys(matches).length
     });
 });
 
 // ─────────────────────────────────────────────────────────────
-// POST /create-match
-// Body: { userId, username, avatarUrl }
-// Returns: { code, match }
+// POST /find-match
+// Body: { userId, username, avatarUrl, timeControl }
+// Response: { status: 'searching' } or { status: 'matched', match }
 // ─────────────────────────────────────────────────────────────
-app.post('/create-match', (req, res) => {
-    const { userId, username, avatarUrl } = req.body;
+app.post('/find-match', (req, res) => {
+    const { userId, username, avatarUrl, timeControl } = req.body;
 
-    if (!username) {
-        return res.status(400).json({ error: 'username required' });
+    if (!userId || !username) {
+        return res.status(400).json({ error: 'userId and username required' });
     }
 
-    try {
-        const code = generateUniqueCode();
-        const now = Date.now();
-
-        matches[code] = {
-            code,
-            createdAt: now,
-            createdBy: { userId: userId || 'unknown', username, avatarUrl: avatarUrl || '' },
-            players: [{
-                userId: userId || 'unknown',
-                username,
-                avatarUrl: avatarUrl || '',
-                joinedAt: now
-            }],
-            status: 'waiting',
-            gameState: 'white-turn',
-            board: null,
-            moves: [],
-            lastActivity: now
-        };
-
-        console.log(`[create] ${username} created match ${code}`);
-
-        res.json({
-            success: true,
-            code,
-            match: publicMatchView(matches[code])
-        });
-    } catch (err) {
-        console.error('[create] error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─────────────────────────────────────────────────────────────
-// POST /join-match
-// Body: { code, userId, username, avatarUrl }
-// Returns: { success, match }
-// ─────────────────────────────────────────────────────────────
-app.post('/join-match', (req, res) => {
-    const { code, userId, username, avatarUrl } = req.body;
-
-    if (!code) return res.status(400).json({ error: 'code required' });
-    if (!username) return res.status(400).json({ error: 'username required' });
-
-    const normalizedCode = code.trim().toUpperCase();
-
-    if (!matches[normalizedCode]) {
-        return res.status(404).json({ error: 'Match not found' });
-    }
-
-    const match = matches[normalizedCode];
-
-    if (match.status === 'finished') {
-        return res.status(410).json({ error: 'Match already finished' });
-    }
-
-    if (match.players.length >= 2) {
-        // Check if it's the same user rejoining
-        const existing = match.players.find(p => p.userId === userId);
-        if (!existing) {
-            return res.status(409).json({ error: 'Match is full' });
+    // If already in a match, return it
+    if (userToMatch[userId]) {
+        const existing = matches[userToMatch[userId]];
+        if (existing && existing.status !== 'finished') {
+            return res.json({
+                status: 'matched',
+                match: publicMatchView(existing, userId)
+            });
         }
-        // Same user, just return current state
-        return res.json({ success: true, match: publicMatchView(match) });
+        // Clean up stale reference
+        delete userToMatch[userId];
     }
 
-    // Check if user already in match
-    const existing = match.players.find(p => p.userId === userId);
-    if (existing) {
-        return res.json({ success: true, match: publicMatchView(match) });
+    // If already in queue, remove old entry (re-queue with fresh timestamp)
+    const existingQueueIdx = queue.findIndex(p => p.userId === userId);
+    if (existingQueueIdx !== -1) {
+        queue.splice(existingQueueIdx, 1);
     }
 
-    // Add second player
-    match.players.push({
-        userId: userId || 'unknown',
-        username,
-        avatarUrl: avatarUrl || '',
-        joinedAt: Date.now()
-    });
-    match.lastActivity = Date.now();
+    // Look for another waiting player with the SAME time control
+    const tc = timeControl || 600;
+    const opponentIdx = queue.findIndex(p => p.timeControl === tc);
 
-    // Both players in → activate match
-    if (match.players.length === 2) {
-        match.status = 'active';
-        match.gameState = 'white-turn';
-        console.log(`[join] ${username} joined ${normalizedCode} — MATCH ACTIVE`);
-    } else {
-        console.log(`[join] ${username} joined ${normalizedCode}`);
+    if (opponentIdx === -1) {
+        // No match — add to queue
+        queue.push({
+            userId,
+            username,
+            avatarUrl: avatarUrl || '',
+            timeControl: tc,
+            joinedQueueAt: Date.now()
+        });
+        console.log(`[queue] ${username} waiting (${queue.length} in queue)`);
+        return res.json({ status: 'searching' });
     }
+
+    // Match found! Remove from queue and create match
+    const opponent = queue.splice(opponentIdx, 1)[0];
+    const secretCode = generateSecretCode();
+    const now = Date.now();
+
+    matches[secretCode] = {
+        code: secretCode,
+        createdAt: now,
+        lastActivity: now,
+        players: [
+            { userId: opponent.userId, username: opponent.username, avatarUrl: opponent.avatarUrl, joinedAt: now },
+            { userId, username, avatarUrl: avatarUrl || '', joinedAt: now }
+        ],
+        status: 'active',
+        gameState: 'white-turn',
+        moves: [],
+        timeControl: tc
+    };
+
+    userToMatch[opponent.userId] = secretCode;
+    userToMatch[userId] = secretCode;
+
+    console.log(`[match] ${opponent.username} vs ${username} — started`);
 
     res.json({
-        success: true,
-        match: publicMatchView(match)
+        status: 'matched',
+        match: publicMatchView(matches[secretCode], userId)
     });
 });
 
 // ─────────────────────────────────────────────────────────────
-// GET /match-status?code=VCN-XXXXXX&userId=abc
-// Returns current match state
+// POST /cancel-search
+// Body: { userId }
+// ─────────────────────────────────────────────────────────────
+app.post('/cancel-search', (req, res) => {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const idx = queue.findIndex(p => p.userId === userId);
+    if (idx !== -1) {
+        queue.splice(idx, 1);
+        console.log(`[queue] Removed ${userId} from queue`);
+    }
+    res.json({ success: true });
+});
+
+// ─────────────────────────────────────────────────────────────
+// GET /match-status?userId=X
+// Player polls this to know if they've been matched
 // ─────────────────────────────────────────────────────────────
 app.get('/match-status', (req, res) => {
-    const code = (req.query.code || '').trim().toUpperCase();
-    const userId = req.query.userId || null;
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    if (!code) return res.status(400).json({ error: 'code required' });
-    if (!matches[code]) return res.status(404).json({ error: 'Match not found' });
+    // In queue?
+    const inQueue = queue.some(p => p.userId === userId);
 
-    const match = matches[code];
-    match.lastActivity = Date.now();
-
-    const view = publicMatchView(match);
-    if (userId) {
-        view.isInMatch = match.players.some(p => p.userId === userId);
-        view.yourColor = match.players[0] && match.players[0].userId === userId ? 'white'
-                       : match.players[1] && match.players[1].userId === userId ? 'black'
-                       : null;
+    // In active match?
+    const code = userToMatch[userId];
+    if (code && matches[code]) {
+        const match = matches[code];
+        match.lastActivity = Date.now();
+        return res.json({
+            status: 'matched',
+            match: publicMatchView(match, userId)
+        });
     }
 
-    res.json(view);
+    if (inQueue) {
+        return res.json({ status: 'searching' });
+    }
+
+    return res.json({ status: 'idle' });
 });
 
 // ─────────────────────────────────────────────────────────────
 // POST /submit-move
-// Body: { code, userId, move: { from: [r,c], to: [r,c], ... } }
+// Body: { userId, move }
 // ─────────────────────────────────────────────────────────────
 app.post('/submit-move', (req, res) => {
-    const { code, userId, move } = req.body;
+    const { userId, move } = req.body;
+    if (!userId || !move) return res.status(400).json({ error: 'userId and move required' });
 
-    if (!code) return res.status(400).json({ error: 'code required' });
-    if (!userId) return res.status(400).json({ error: 'userId required' });
-    if (!move) return res.status(400).json({ error: 'move required' });
+    const code = userToMatch[userId];
+    if (!code || !matches[code]) return res.status(404).json({ error: 'No active match' });
 
-    const normalizedCode = code.trim().toUpperCase();
-    if (!matches[normalizedCode]) return res.status(404).json({ error: 'Match not found' });
-
-    const match = matches[normalizedCode];
+    const match = matches[code];
     match.lastActivity = Date.now();
 
     if (match.status !== 'active') {
         return res.status(409).json({ error: 'Match not active' });
     }
 
-    // Verify user is in this match
     const playerIndex = match.players.findIndex(p => p.userId === userId);
-    if (playerIndex === -1) {
-        return res.status(403).json({ error: 'You are not in this match' });
-    }
+    if (playerIndex === -1) return res.status(403).json({ error: 'Not in match' });
 
-    // Verify it's this player's turn
     const playerColor = playerIndex === 0 ? 'white' : 'black';
     if (playerColor === 'white' && match.gameState !== 'white-turn') {
         return res.status(409).json({ error: 'Not your turn' });
@@ -287,7 +274,6 @@ app.post('/submit-move', (req, res) => {
         return res.status(409).json({ error: 'Not your turn' });
     }
 
-    // Add move to list
     const moveRecord = {
         index: match.moves.length,
         playerId: userId,
@@ -296,11 +282,9 @@ app.post('/submit-move', (req, res) => {
         at: Date.now()
     };
     match.moves.push(moveRecord);
-
-    // Toggle turn
     match.gameState = playerColor === 'white' ? 'black-turn' : 'white-turn';
 
-    console.log(`[move] ${normalizedCode} #${moveRecord.index} by ${playerColor}`);
+    console.log(`[move] ${playerColor} moved (index ${moveRecord.index})`);
 
     res.json({
         success: true,
@@ -311,59 +295,76 @@ app.post('/submit-move', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// GET /get-moves?code=VCN-XXXXXX&since=0
-// Returns moves AFTER the `since` index
+// POST /get-moves
+// Body: { userId, since }
 // ─────────────────────────────────────────────────────────────
-app.get('/get-moves', (req, res) => {
-    const code = (req.query.code || '').trim().toUpperCase();
-    const since = parseInt(req.query.since) || 0;
+app.post('/get-moves', (req, res) => {
+    const { userId, since } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    if (!code) return res.status(400).json({ error: 'code required' });
-    if (!matches[code]) return res.status(404).json({ error: 'Match not found' });
+    const code = userToMatch[userId];
+    if (!code || !matches[code]) return res.status(404).json({ error: 'No active match' });
 
     const match = matches[code];
     match.lastActivity = Date.now();
 
-    const newMoves = match.moves.slice(since);
+    const sinceIdx = parseInt(since) || 0;
+    const newMoves = match.moves.slice(sinceIdx);
+
+    // Filter out the player's own moves (they already applied them)
+    const opponentMoves = newMoves.filter(m => m.playerId !== userId);
 
     res.json({
-        code,
         status: match.status,
         gameState: match.gameState,
         moveCount: match.moves.length,
-        moves: newMoves
+        moves: opponentMoves
     });
 });
 
 // ─────────────────────────────────────────────────────────────
 // POST /finish-match
-// Body: { code, result }  result = 'white-won' | 'black-won' | 'draw'
+// Body: { userId, result }
 // ─────────────────────────────────────────────────────────────
 app.post('/finish-match', (req, res) => {
-    const { code, result } = req.body;
-    if (!code) return res.status(400).json({ error: 'code required' });
+    const { userId, result } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    const normalizedCode = code.trim().toUpperCase();
-    if (!matches[normalizedCode]) return res.status(404).json({ error: 'Match not found' });
+    const code = userToMatch[userId];
+    if (!code || !matches[code]) return res.status(404).json({ error: 'No active match' });
 
-    const match = matches[normalizedCode];
+    const match = matches[code];
     match.status = 'finished';
     match.gameState = result || 'draw';
     match.lastActivity = Date.now();
 
-    console.log(`[finish] ${normalizedCode} — ${match.gameState}`);
+    console.log(`[finish] Match ended: ${match.gameState}`);
 
-    res.json({ success: true, match: publicMatchView(match) });
+    res.json({ success: true });
 });
 
 // ─────────────────────────────────────────────────────────────
-// GET /list-matches — shows all waiting matches (for debugging)
+// POST /leave-match
+// Body: { userId }
+// Call this when a player exits mid-game
 // ─────────────────────────────────────────────────────────────
-app.get('/list-matches', (req, res) => {
-    const list = Object.values(matches)
-        .filter(m => m.status === 'waiting')
-        .map(m => publicMatchView(m));
-    res.json({ count: list.length, matches: list });
+app.post('/leave-match', (req, res) => {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const code = userToMatch[userId];
+    if (code && matches[code]) {
+        matches[code].status = 'finished';
+        matches[code].gameState = 'draw';
+        const players = matches[code].players.map(p => p.userId);
+        players.forEach(id => delete userToMatch[id]);
+    }
+
+    // Also remove from queue
+    const idx = queue.findIndex(p => p.userId === userId);
+    if (idx !== -1) queue.splice(idx, 1);
+
+    res.json({ success: true });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -372,7 +373,7 @@ app.get('/list-matches', (req, res) => {
 app.listen(PORT, () => {
     console.log('');
     console.log('=================================');
-    console.log('  VCN MATCHMAKING SERVER ONLINE');
+    console.log('  VCN RANDOM MATCHMAKING ONLINE');
     console.log('  http://localhost:' + PORT);
     console.log('=================================');
     console.log('');
